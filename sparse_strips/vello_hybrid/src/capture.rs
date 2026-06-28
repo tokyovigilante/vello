@@ -196,9 +196,16 @@ pub fn render_to_capture(
     let mut state = SchedulerState::default();
     let filter_context = FilterContext::new(AtlasConfig::default());
 
-    // Solid-only cut: no paint encoding yet, so a single trailing zero offset and no paints.
-    let paint_idxs: Vec<u32> = vec![0];
+    // The scheduler indexes `paint_idxs` and `encoded_paints` by paint_id for every
+    // non-solid (`Paint::Indexed`) paint, so both must span the scene's paint count or it
+    // panics on the first gradient (`paint_idxs.get(paint_id).unwrap()`). Size paint_idxs
+    // to len+1 (all-zero texel offsets) and pass the scene's `EncodedPaint` slice so
+    // `process_paint` packs valid gradient/blur/image paint *metadata* into the strips.
+    // The encoded-paint *texel* buffer and gradient LUT are still empty — the GPU shader
+    // renders these paints transparent until the gradient stage (H2a) builds them. This
+    // lets the full scene (solid fills + text + clips) capture without a panic (H2c).
     let encoded_paints = scene.encoded_paints.borrow();
+    let paint_idxs: Vec<u32> = vec![0; encoded_paints.len() + 1];
 
     let config = Config {
         width,
