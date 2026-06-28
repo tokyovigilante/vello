@@ -45,13 +45,15 @@
 
 extern crate alloc;
 
+#[cfg(feature = "capture")]
+pub mod capture;
 pub(crate) mod filter;
 mod gradient_cache;
 mod render;
 mod resources;
 mod sampling;
 mod scene;
-#[cfg(any(feature = "webgl", feature = "wgpu"))]
+#[cfg(any(feature = "webgl", feature = "wgpu", feature = "capture"))]
 mod schedule;
 #[cfg(feature = "text")]
 mod text;

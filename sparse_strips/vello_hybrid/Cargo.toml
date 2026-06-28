@@ -59,6 +59,9 @@ wgpu_default = ["wgpu", "wgpu/default"]
 text = ["dep:glifo", "glifo/std"]
 probe = ["vello_common/probe"]
 webgl = ["dep:js-sys", "dep:web-sys", "dep:vello_sparse_shaders", "vello_sparse_shaders/glsl"]
+# Sumi fork: capture the scheduler's GPU workload without a GPU backend. Pulls in the
+# pure-CPU scheduler but none of wgpu/webgl. See `capture` module.
+capture = []
 
 [lints]
 workspace = true
