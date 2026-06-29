@@ -37,10 +37,12 @@ use vello_common::render_graph::LayerId;
 
 use crate::gradient_cache::GradientRampCache;
 use crate::render::common::{
-    pack_radial_kind_and_swapped, pack_texture_width_and_extend_mode, GpuEncodedPaint,
-    GpuLinearGradient, GpuRadialGradient, GpuSweepGradient,
+    pack_radial_kind_and_swapped, pack_texture_width_and_extend_mode, GpuBlurredRoundedRect,
+    GpuEncodedPaint, GpuLinearGradient, GpuRadialGradient, GpuSweepGradient,
 };
-use vello_common::encode::{EncodedGradient, EncodedKind, EncodedPaint, RadialKind};
+use vello_common::encode::{
+    EncodedBlurredRoundedRectangle, EncodedGradient, EncodedKind, EncodedPaint, RadialKind,
+};
 use vello_common::fearless_simd::Level;
 use vello_common::peniko::Extend;
 
@@ -116,6 +118,22 @@ fn encode_gradient_paint(
             _padding: [0, 0],
         }),
     }
+}
+
+/// Encode one blurred-rounded-rectangle paint into its GPU texel form. Replicates the
+/// (wgpu-only) `Renderer::encode_blurred_rounded_rect_paint` so the capture path can build
+/// the same `encoded_paints` entry the wgpu backend uploads, without the wgpu feature. The
+/// Slang shader's `calculate_blurred_rounded_rect` reads these five texels.
+fn encode_blurred_rounded_rect_paint(rect: &EncodedBlurredRoundedRectangle) -> GpuEncodedPaint {
+    GpuEncodedPaint::BlurredRoundedRect(GpuBlurredRoundedRect {
+        transform: rect.transform.as_coeffs().map(|x| x as f32),
+        color: rect.color.as_premul_rgba8().to_u32(),
+        invert: u32::from(rect.invert),
+        params0: [rect.exponent, rect.recip_exponent, rect.scale, rect.std_dev_inv],
+        params1: [rect.min_edge, rect.w, rect.h, rect.r1],
+        size: [rect.width, rect.height],
+        _padding1: [0, 0],
+    })
 }
 
 /// Kind of render target a [`CapturedPass`] draws into.
@@ -295,9 +313,18 @@ pub fn render_to_capture(
     let mut current_idx: u32 = 0;
     for (i, paint) in encoded_paints.iter().enumerate() {
         paint_idxs[i] = current_idx;
-        if let EncodedPaint::Gradient(gradient) = paint {
-            let (gradient_start, gradient_width) = gradient_cache.get_or_create_ramp(gradient);
-            let gpu_paint = encode_gradient_paint(gradient, gradient_width, gradient_start);
+        let gpu_paint = match paint {
+            EncodedPaint::Gradient(gradient) => {
+                let (gradient_start, gradient_width) = gradient_cache.get_or_create_ramp(gradient);
+                Some(encode_gradient_paint(gradient, gradient_width, gradient_start))
+            }
+            EncodedPaint::BlurredRoundedRect(rect) => {
+                Some(encode_blurred_rounded_rect_paint(rect))
+            }
+            // Images / external textures not encoded yet (shader renders them transparent).
+            _ => None,
+        };
+        if let Some(gpu_paint) = gpu_paint {
             // Texel count = serialized byte length / 16 (RGBA32Uint) — keep this in sync
             // with `serialize_to_buffer` rather than hardcoding per-kind sizes.
             current_idx += gpu_paint.as_bytes().len() as u32 / 16;
