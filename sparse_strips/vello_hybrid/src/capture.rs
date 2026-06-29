@@ -35,6 +35,89 @@ use crate::{Config, GpuStrip, RenderError, Scene};
 use vello_common::multi_atlas::AtlasConfig;
 use vello_common::render_graph::LayerId;
 
+use crate::gradient_cache::GradientRampCache;
+use crate::render::common::{
+    pack_radial_kind_and_swapped, pack_texture_width_and_extend_mode, GpuEncodedPaint,
+    GpuLinearGradient, GpuRadialGradient, GpuSweepGradient,
+};
+use vello_common::encode::{EncodedGradient, EncodedKind, EncodedPaint, RadialKind};
+use vello_common::fearless_simd::Level;
+use vello_common::peniko::Extend;
+
+/// Encode one gradient paint into its GPU texel form. Replicates the (wgpu-only)
+/// `Renderer::encode_gradient_paint` so the capture path can build the same
+/// `encoded_paints` buffer the wgpu backend uploads, without depending on the wgpu
+/// feature. `gradient_width`/`gradient_start` come from the shared `GradientRampCache`.
+fn encode_gradient_paint(
+    gradient: &EncodedGradient,
+    gradient_width: u32,
+    gradient_start: u32,
+) -> GpuEncodedPaint {
+    let transform = gradient.transform.as_coeffs().map(|x| x as f32);
+    let extend_mode = match gradient.extend {
+        Extend::Pad => 0,
+        Extend::Repeat => 1,
+        Extend::Reflect => 2,
+    };
+    let texture_width_and_extend_mode =
+        pack_texture_width_and_extend_mode(gradient_width, extend_mode);
+
+    match &gradient.kind {
+        EncodedKind::Linear(_) => GpuEncodedPaint::LinearGradient(GpuLinearGradient {
+            texture_width_and_extend_mode,
+            gradient_start,
+            transform,
+        }),
+        EncodedKind::Radial(radial) => {
+            let (kind, bias, scale, fp0, fp1, fr1, f_focal_x, f_is_swapped, scaled_r0_squared) =
+                match radial {
+                    RadialKind::Radial { bias, scale } => {
+                        (0, *bias, *scale, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+                    }
+                    RadialKind::Strip { scaled_r0_squared } => {
+                        (1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, *scaled_r0_squared)
+                    }
+                    RadialKind::Focal {
+                        focal_data,
+                        fp0,
+                        fp1,
+                    } => (
+                        2,
+                        *fp0,
+                        *fp1,
+                        *fp0,
+                        *fp1,
+                        focal_data.fr1,
+                        focal_data.f_focal_x,
+                        focal_data.f_is_swapped as u32,
+                        0.0,
+                    ),
+                };
+            GpuEncodedPaint::RadialGradient(GpuRadialGradient {
+                texture_width_and_extend_mode,
+                gradient_start,
+                transform,
+                kind_and_f_is_swapped: pack_radial_kind_and_swapped(kind, f_is_swapped),
+                bias,
+                scale,
+                fp0,
+                fp1,
+                fr1,
+                f_focal_x,
+                scaled_r0_squared,
+            })
+        }
+        EncodedKind::Sweep(sweep) => GpuEncodedPaint::SweepGradient(GpuSweepGradient {
+            texture_width_and_extend_mode,
+            gradient_start,
+            transform,
+            start_angle: sweep.start_angle,
+            inv_angle_delta: sweep.inv_angle_delta,
+            _padding: [0, 0],
+        }),
+    }
+}
+
 /// Kind of render target a [`CapturedPass`] draws into.
 ///
 /// Mirrors the crate-internal `StripPassRenderTarget`, flattened for the FFI.
@@ -196,16 +279,36 @@ pub fn render_to_capture(
     let mut state = SchedulerState::default();
     let filter_context = FilterContext::new(AtlasConfig::default());
 
-    // The scheduler indexes `paint_idxs` and `encoded_paints` by paint_id for every
-    // non-solid (`Paint::Indexed`) paint, so both must span the scene's paint count or it
-    // panics on the first gradient (`paint_idxs.get(paint_id).unwrap()`). Size paint_idxs
-    // to len+1 (all-zero texel offsets) and pass the scene's `EncodedPaint` slice so
-    // `process_paint` packs valid gradient/blur/image paint *metadata* into the strips.
-    // The encoded-paint *texel* buffer and gradient LUT are still empty — the GPU shader
-    // renders these paints transparent until the gradient stage (H2a) builds them. This
-    // lets the full scene (solid fills + text + clips) capture without a panic (H2c).
+    // H2a — gradients. Build the GPU paint buffer + ramp LUT exactly as the wgpu
+    // backend's `prepare_gpu_encoded_paints` does, but for gradients only: walk the
+    // scene's `EncodedPaint`s, ramp each gradient via the shared `GradientRampCache`,
+    // encode it to texels, and record its texel offset in `paint_idxs`. This MUST run
+    // before `do_scene` — the scheduler packs `paint_idxs[paint_id]` into each strip's
+    // paint field. Images, external textures and blurred rounded rects are not encoded
+    // yet (their `paint_idxs` entry points at the running offset); the GPU shader still
+    // renders those paint types transparent, so leaving them unencoded is harmless.
     let encoded_paints = scene.encoded_paints.borrow();
-    let paint_idxs: Vec<u32> = vec![0; encoded_paints.len() + 1];
+    let level = Level::try_detect().unwrap_or_else(Level::baseline);
+    let mut gradient_cache = GradientRampCache::new(encoded_paints.len() as u32, level);
+    let mut gpu_paints: Vec<GpuEncodedPaint> = Vec::with_capacity(encoded_paints.len());
+    let mut paint_idxs: Vec<u32> = vec![0; encoded_paints.len() + 1];
+    let mut current_idx: u32 = 0;
+    for (i, paint) in encoded_paints.iter().enumerate() {
+        paint_idxs[i] = current_idx;
+        if let EncodedPaint::Gradient(gradient) = paint {
+            let (gradient_start, gradient_width) = gradient_cache.get_or_create_ramp(gradient);
+            let gpu_paint = encode_gradient_paint(gradient, gradient_width, gradient_start);
+            // Texel count = serialized byte length / 16 (RGBA32Uint) — keep this in sync
+            // with `serialize_to_buffer` rather than hardcoding per-kind sizes.
+            current_idx += gpu_paint.as_bytes().len() as u32 / 16;
+            gpu_paints.push(gpu_paint);
+        }
+    }
+    paint_idxs[encoded_paints.len()] = current_idx;
+
+    let mut encoded_paints_bytes = vec![0_u8; current_idx as usize * 16];
+    GpuEncodedPaint::serialize_to_buffer(&gpu_paints, &mut encoded_paints_bytes);
+    let gradient_lut = gradient_cache.take_luts();
 
     let config = Config {
         width,
@@ -237,9 +340,9 @@ pub fn render_to_capture(
     Ok(CapturedFrame {
         config,
         alphas,
-        encoded_paints: Vec::new(),
+        encoded_paints: encoded_paints_bytes,
         paint_idxs,
-        gradient_lut: Vec::new(),
+        gradient_lut,
         ops: backend.ops,
     })
 }
