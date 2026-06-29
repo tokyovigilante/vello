@@ -240,13 +240,17 @@ pub(crate) enum StripPassRenderTarget {
 
 /// Specifies a run of strips inside [`Draw`] that can be drawn with the same external texture
 /// binding.
+///
+/// Fields are `pub` (Sumi capture fork delta) so the out-of-crate FFI can read the
+/// per-run texture id + strip range from a captured frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternalTextureRun {
-    pub(crate) texture_id: TextureId,
+pub struct ExternalTextureRun {
+    /// Identifies the externally-bound texture for this run's strips.
+    pub texture_id: TextureId,
 
     /// Start index of the strip range for this run. The end is implicitly the start of the next
     /// run, or, for the last run, the total number of strips.
-    pub(crate) strips_start: usize,
+    pub strips_start: usize,
 }
 
 /// Trait for abstracting the renderer backend from the scheduler.

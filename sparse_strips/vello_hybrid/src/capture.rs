@@ -30,6 +30,9 @@ use crate::schedule::{
     ExternalTextureRun, LoadOp, RendererBackend, RootRenderTarget, Scheduler, SchedulerState,
     StripPassRenderTarget,
 };
+/// Re-exported so the out-of-crate FFI can read per-run texture id + strip range
+/// from `CapturedPass::external_runs` (Sumi capture fork delta).
+pub use crate::schedule::ExternalTextureRun as CapturedExternalTextureRun;
 use crate::filter::FilterContext;
 use crate::{Config, GpuStrip, RenderError, Scene};
 use vello_common::multi_atlas::AtlasConfig;
@@ -37,12 +40,18 @@ use vello_common::render_graph::LayerId;
 
 use crate::gradient_cache::GradientRampCache;
 use crate::render::common::{
-    pack_radial_kind_and_swapped, pack_texture_width_and_extend_mode, GpuBlurredRoundedRect,
+    pack_image_offset, pack_image_params, pack_image_size, pack_radial_kind_and_swapped,
+    pack_texture_width_and_extend_mode, pack_tint, GpuBlurredRoundedRect, GpuEncodedImage,
     GpuEncodedPaint, GpuLinearGradient, GpuRadialGradient, GpuSweepGradient,
 };
 use vello_common::encode::{
-    EncodedBlurredRoundedRectangle, EncodedGradient, EncodedKind, EncodedPaint, RadialKind,
+    EncodedBlurredRoundedRectangle, EncodedExternalTexture, EncodedGradient, EncodedKind,
+    EncodedPaint, RadialKind,
 };
+
+/// Image-source flag (bit 14 of `image_params`): 1 = externally-bound texture
+/// (sampled directly), 0 = atlas. Mirrors `wgpu.rs`'s private constant.
+const EXTERNAL_IMAGE_SOURCE_FLAG: u32 = 1 << 14;
 use vello_common::fearless_simd::Level;
 use vello_common::peniko::Extend;
 
@@ -118,6 +127,34 @@ fn encode_gradient_paint(
             _padding: [0, 0],
         }),
     }
+}
+
+/// Encode one external-texture paint into its GPU texel form. Replicates the
+/// (wgpu-only) `Renderer::encode_external_texture_paint` so the capture path can
+/// build the same `GpuEncodedImage` the wgpu backend uploads, without the wgpu
+/// feature. `source_region` becomes the image offset/size; the source-kind flag
+/// marks it external (sampled directly rather than from the atlas). The texture
+/// identity travels separately in `CapturedPass::external_runs` (Sumi maps the
+/// `texture_id` to a bindless sampled-image slot).
+fn encode_external_texture_paint(image: &EncodedExternalTexture) -> GpuEncodedPaint {
+    let transform = image.transform.as_coeffs().map(|x| x as f32);
+    let region = image.source_region;
+    let image_params = pack_image_params(
+        image.sampler.quality as u32,
+        image.sampler.x_extend as u32,
+        image.sampler.y_extend as u32,
+        0,
+    ) | EXTERNAL_IMAGE_SOURCE_FLAG;
+    let (tint, tint_mode) = pack_tint(image.tint);
+    GpuEncodedPaint::Image(GpuEncodedImage {
+        image_params,
+        image_size: pack_image_size(region.width(), region.height()),
+        image_offset: pack_image_offset(region.x0, region.y0),
+        transform,
+        tint,
+        tint_mode,
+        image_padding: 0,
+    })
 }
 
 /// Encode one blurred-rounded-rectangle paint into its GPU texel form. Replicates the
@@ -321,7 +358,8 @@ pub fn render_to_capture(
             EncodedPaint::BlurredRoundedRect(rect) => {
                 Some(encode_blurred_rounded_rect_paint(rect))
             }
-            // Images / external textures not encoded yet (shader renders them transparent).
+            EncodedPaint::ExternalTexture(img) => Some(encode_external_texture_paint(img)),
+            // Atlas images not encoded yet (Sumi uses external/bindless textures).
             _ => None,
         };
         if let Some(gpu_paint) = gpu_paint {
